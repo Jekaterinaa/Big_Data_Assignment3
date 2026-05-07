@@ -20,7 +20,7 @@ big_data_assignment3/
     ├── reset_and_insert.py       # Earlier single-threaded reference inserter
     └── clear_db.py               # Helper: deletes all docs from ais_data
 
-
+```
 ---
 
 ## Table of Contents
