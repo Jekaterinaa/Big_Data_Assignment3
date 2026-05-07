@@ -497,7 +497,11 @@ python noise_filtering.py --workers 4 --batch-size 20
 | `--batch-size` | `20` | Number of MMSIs processed per worker batch |
 
 > **Note:** If you re-run `noise_filtering.py` without clearing `ais_filtered` first, the script will drop and recreate indexes automatically but will insert on top of existing filtered data. Drop the collection first in mongosh for a clean run:
-> ```js
+> ```bash
+>docker exec -it mongos mongosh --port 27017
+>```
+
+>```javascript
 > use vesselDB
 > db.ais_filtered.drop()
 > ```
