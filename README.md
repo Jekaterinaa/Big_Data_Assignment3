@@ -38,7 +38,7 @@ big_data_assignment3/
 11. [Stopping and Cleaning Up](#stopping-and-cleaning-up)
 12. [Troubleshooting](#troubleshooting)
 13. [Task 3 — Parallel Data Noise Filtering](#task-3--parallel-data-noise-filtering)
-14. [Fault Tolerance Demo (Task 5)](#fault-tolerance-demo-task-5)
+14. [Task 4 — Delta-t Calculation and Histogram Generation](#task-4--delta-t-calculation-and-histogram-generation)
 
 ---
 
@@ -534,54 +534,108 @@ db.ais_filtered.getShardDistribution()       // Check spread across shards
 
 ---
 
-## Fault Tolerance Demo (Task 5)
+## Task 4 — Delta-t Calculation and Histogram Generation
 
-Use the following step-by-step commands during the presentation video to demonstrate that the cluster survives a node failure. Run each command one at a time.
+The `delta_t_histogram.py` script reads from the `ais_filtered` collection populated by Task 3, computes the time difference between consecutive data points for each vessel in parallel, stores the results in a new `delta_t` collection, and generates a histogram for analysis.
+
+- **One MongoClient per worker thread** — matches the pattern established in Tasks 2 & 3
+- **Per-vessel parallelism** — distinct MMSIs are partitioned into batches, each batch processed by one worker
+- **Delta-t stored in MongoDB** — each pair of consecutive timestamps produces one document in `vesselDB.delta_t`
+- **Two-chart histogram output** — linear scale (clipped for readability) and log scale (full range showing the tail)
+
+---
+
+### How it Works
+
+1. The old `delta_t` collection is dropped and indexes are recreated fresh.
+2. All distinct MMSI values are fetched from `ais_filtered` and partitioned into worker batches.
+3. Each worker opens its own `MongoClient`, fetches timestamps for each MMSI sorted ascending, and computes delta-t in milliseconds between every consecutive pair.
+4. Negative deltas (out-of-order records) are discarded.
+5. Delta-t documents are bulk-inserted into `vesselDB.delta_t`.
+6. After all workers finish, the histogram is generated from the full `delta_t` collection and saved as `delta_t_histogram.png`.
+
+---
+
+### Indexes Created
+
+**On `delta_t` (output):**
+- `MMSI` — fast per-vessel lookup
+- `delta_ms` — efficient range queries and percentile calculations
+
+---
+
+### Running the Script
+
+Make sure Task 3 has been run first and `ais_filtered` contains documents. Then:
 
 ```bash
-# 1. Show all 10 containers are running
-docker compose ps
-
-# 2. Show current document count (proof data is loaded)
-docker exec mongos mongosh --port 27017 --eval 'db.getSiblingDB("vesselDB").ais_data.countDocuments({})'
-
-# 3. Show shard1 has all 3 members healthy (1 PRIMARY + 2 SECONDARY)
-docker exec shard1a mongosh --quiet --port 27018 --eval "rs.status().members.forEach(m => print(m.name + ' ' + m.stateStr))"
-
-# 4. Simulate hardware failure — kill the shard1 PRIMARY
-docker stop shard1a
-
-# 5. Wait ~15 seconds for failover, then show a new PRIMARY was elected
-sleep 15
-docker exec shard1b mongosh --quiet --port 27018 --eval "rs.status().members.forEach(m => print(m.name + ' ' + m.stateStr))"
-
-# 6. Prove the cluster still works — read returns the same count as before
-docker exec mongos mongosh --port 27017 --eval 'db.getSiblingDB("vesselDB").ais_data.countDocuments({})'
-
-# 7. Prove writes still work — insert a test document while a node is down
-docker exec mongos mongosh --port 27017 --eval '
-db = db.getSiblingDB("vesselDB");
-db.ais_data.insertOne({MMSI: 999999999, test: "fault_tolerance_demo"});
-print("New count: " + db.ais_data.countDocuments({}));
-'
-
-# 8. Recover the failed node — auto-rejoins as SECONDARY and syncs missed writes
-docker start shard1a
-sleep 15
-docker exec shard1b mongosh --quiet --port 27018 --eval "rs.status().members.forEach(m => print(m.name + ' ' + m.stateStr))"
-
-# 9. Cleanup the test document
-docker exec mongos mongosh --port 27017 --eval 'db.getSiblingDB("vesselDB").ais_data.deleteOne({MMSI: 999999999})'
+python delta_t_histogram.py --workers 4 --batch-size 20
 ```
 
-**Talking points for each step:**
+**Arguments:**
 
-1. All 10 containers are healthy — the cluster is fully operational.
-2. Baseline document count before the failure.
-3. All 3 members of shard1 are online (1 PRIMARY + 2 SECONDARY).
-4. We simulate hardware failure by stopping the PRIMARY node — the most dramatic failure scenario.
-5. The replica set detects the failure — the 2 surviving members elect a new PRIMARY automatically.
-6. **Key moment:** the application sees no data loss — same count as before.
-7. **Key moment:** writes still succeed even with a node missing.
-8. The failed node comes back online, auto-rejoins as SECONDARY, and syncs missed writes.
-9. Cleanup — remove the test document.
+| Flag | Default | Description |
+|------|---------|-------------|
+| `--workers` | `4` | Number of parallel worker threads |
+| `--batch-size` | `20` | Number of MMSIs processed per worker batch |
+| `--bins` | `100` | Number of histogram bins |
+| `--max-delta-ms` | `600000` | X-axis clip threshold for the linear histogram (ms) |
+| `--skip-compute` | off | Skip delta-t computation and regenerate histogram only |
+
+---
+
+### Results
+
+Running on the full `aisdk-2026-04-18.csv` dataset after Task 3 filtering:
+
+| Metric | Value |
+|--------|-------|
+| Vessels processed | 1,858 |
+| Delta-t pairs computed | 13,956,386 |
+| Min delta-t | 0.0 ms |
+| Max delta-t | 74,985,000 ms (~1,250 min) |
+| Mean | 9,264 ms (9.3s) |
+| Median | 4,000 ms (4.0s) |
+| p95 | 20,000 ms (20s) |
+| p99 | 141,000 ms (141s) |
+| Within 1 minute | 98.42% |
+| Within 5 minutes | 99.85% |
+| Within 10 minutes | 99.96% |
+
+---
+
+### Histogram Analysis
+
+The histogram reveals two key insights:
+
+**Left chart (linear scale):** The overwhelming majority of intervals cluster under 20 seconds, with the distribution dropping off sharply. This confirms standard Class A AIS transponder behaviour — vessels underway report every 2–10 seconds.
+
+**Right chart (log scale):** Shows the full range including the long tail. The small bars at 10⁵–10⁸ seconds represent vessels that went off-grid for extended periods — consistent with ocean crossings or port stays where transponders are turned off.
+
+**Conclusion:** The dataset is dense and highly trackable. With 98.4% of all intervals under 60 seconds and a median of just 4 seconds, the filtered data provides a reliable basis for vessel trajectory reconstruction and behavioural analysis.
+
+---
+
+### Verify Results
+
+```bash
+docker exec -it mongos mongosh --port 27017
+```
+
+```javascript
+use vesselDB
+db.delta_t.countDocuments({})              // Total delta-t pairs
+db.delta_t.distinct("MMSI").length         // Number of vessels with deltas
+db.delta_t.findOne()                       // Inspect a sample document
+db.delta_t.aggregate([{ $group: { _id: null, avg: { $avg: "$delta_ms" }, median: { $avg: "$delta_ms" } } }])
+```
+
+---
+
+### Troubleshooting
+
+| Problem | Solution |
+|---------|----------|
+| `No data in ais_filtered` | Task 3 has not been run yet. Run `noise_filtering.py` first. |
+| `delta_t` collection is empty after run | Check worker output for errors. Verify `ais_filtered` has records with valid timestamps. |
+| Histogram not saved | Ensure `matplotlib` and `numpy` are installed: `pip install matplotlib numpy`. |
